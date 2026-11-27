@@ -56,6 +56,23 @@ logs the loaded SDK version at runtime; you verify compatibility yourself.
 
 ## Build
 
+SDK-independent monitor-connection regression tests can run without ETS DLLs:
+
+```bash
+dotnet test addin-tests -c Release
+```
+
+On Windows PowerShell, an optional offline check against the installed ETS SDK
+demonstrates its group-address conversion contract without opening a bus connection:
+
+```powershell
+.\tools\check-group-address-contract.ps1
+```
+
+The check rejects a project DOM `GroupAddress` object and accepts its numeric
+`UInt16` address or an address string. Group read/write calls must pass the
+numeric address, not the DOM object, despite their first parameter being `object`.
+
 From the repo root:
 
 ```bash

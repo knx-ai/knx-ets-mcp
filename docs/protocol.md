@@ -451,8 +451,12 @@ Long-running operations run asynchronously via the job model.
 
 ## Phase D: Bus / Online Operations
 
-Bus access is serialized: only one bus operation at a time. A parallel call returns
-`error.bus_unavailable`.
+Bus jobs retain exclusive bus ownership. An active group monitor is the exception
+for `group.read` and `group.write`: those operations borrow the monitor's existing
+connection and are serialized with its cleanup. They use the monitor's selected
+`lineRef`, rather than opening another default connection. Other bus operations
+(including programming, scans and ping) remain excluded during the monitor and
+return `error.bus_unavailable`. A second monitor is also excluded.
 
 Read (no idempotencyKey):
 
@@ -500,14 +504,18 @@ Read (no idempotencyKey):
   - SDK: reads the association/address/group-object tables via
     `LocateObject(OT_Associationtable)` + `PID_TABLE` / `DeviceManagement.ReadProperty`.
 - `group.read` `{ gaRef }` -> `{ value }` (hex string or null on timeout)
-  - Reads a group value from the bus. Timeout ~2.3 s (KNX standard).
+   - Reads a group value from the bus. Timeout ~2.3 s (KNX standard).
+   - During a monitor, uses that monitor's connection/line and its responses are
+     available in the capture. Otherwise uses ETS's default group connection.
   - SDK: `KnxCommunicationSync.GroupCommunicationReadSync`.
 - `group.monitor` `{ lineRef?, durationMs? }` -> `{ jobId }`
   - Records group telegrams for a limited duration. Long-running -> job model.
   - `lineRef` (default `"default"`), `durationMs` (1000-300000, default 10000).
   - Job result: `{ telegrams: [{ service, sourceAddress, groupAddress, value, timestamp }] }`
   - **Note (6.3.0):** `GroupMessageReceived` does NOT fire for KNX Secure telegrams.
-  - SDK: `KnxCommunicationSync.GroupMessageReceived` event.
+   - SDK: `KnxCommunicationSync.GroupMessageReceived` event.
+   - Capture is subscribed before the job ID is returned. Cleanup waits for any
+     borrowed synchronous read/write before unsubscribing and disposing the connection.
 
 Mutating (idempotencyKey required):
 
@@ -522,7 +530,9 @@ Mutating (idempotencyKey required):
 - `group.write` `{ gaRef, value, less7Bits? }` -> `{ acknowledged }` (bool)
   - Writes a group value to the bus. `value` as hex string (e.g. `"01"`).
   - `less7Bits` (default false): true if the value is < 7 bits (fits in the APCI byte).
-  - SDK: `KnxCommunicationSync.WriteGroupValueAsync`.
+   - SDK: synchronous `KnxCommunicationSync.GroupCommunicationWrite`.
+   - `acknowledged=true` means the SDK send returned without an exception, not that
+     an actuator or downstream gateway applied the value. Use device feedback.
 
 ## References (Refs)
 
