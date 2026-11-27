@@ -60,6 +60,7 @@ namespace Knx.EtsBridge.Addin
         // synchronized via lock(_busLock).
         // ---------------------------------------------------------------
         private readonly object _busLock = new object();
+        private readonly MonitoredConnection<KnxCommunicationSync> _groupMonitorConnection;
         private string? _busOwner;
 
         /// <summary>
@@ -155,6 +156,7 @@ namespace Knx.EtsBridge.Addin
         public Ets6ProjectGateway(IInitializationContext context)
         {
             _ctx = context ?? throw new ArgumentNullException(nameof(context));
+            _groupMonitorConnection = new MonitoredConnection<KnxCommunicationSync>(_busLock);
             // #4: Capture the UI dispatcher so background tasks can marshal
             // SDK object creation (CreateDeviceManagement) to the UI thread.
             _uiDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
@@ -3726,42 +3728,21 @@ namespace Knx.EtsBridge.Addin
         ///   "Provides a method for synchronous communication" / returns null if no connection.
         /// Verified: M:Knx.Ets.Sdk.Network.KnxCommunicationSync.GroupCommunicationReadSync(
         ///   System.Object, System.Int32) -> Byte[] (SDK XML line 23392)
-        ///   "Reads a group communication value" with groupAddress (object) and timeout (ms).
+        ///   The object address must contain a string or UInt16, not a project DOM object.
         /// </summary>
         public GroupReadResult GroupRead(string gaRef)
         {
             var ga = FindGroupAddress(gaRef);
-            var busOwner = Guid.NewGuid().ToString("D");
-
-            AcquireBus(busOwner);
-            try
+            return WithGroupCommunication(comm =>
             {
-                // Line=null -> default connection.
-                // #9: Create SDK objects on the UI thread (this runs on dispatcher).
-                var comm = Project.Root.CreateSyncKnxGroupCommunication(null);
-                if (comm == null)
-                    throw new BusUnavailableException(
-                        "No group communication available. Select a KNXnet/IP interface in ETS (Bus > Interfaces) and set it as the "
-                          + "current interface.");
-
-                using (comm)
+                // routingCounter is unused; the SDK read timeout remains 2.3 seconds.
+                var raw = comm.GroupCommunicationReadSync((ushort)ga.Address, 0);
+                var value = raw as byte[];
+                return new GroupReadResult
                 {
-                    // The SDK accepts a GroupAddress object, string, or UInt16 for the first param.
-                    // Timeout param is "routingCounter" (unused); timeout is always 2.3 s.
-                    // Return type is object (actually byte[]). Empty byte[] = no response.
-                    var raw = comm.GroupCommunicationReadSync(ga, 0);
-                    var value = raw as byte[];
-
-                    return new GroupReadResult
-                    {
-                        Value = value != null && value.Length > 0 ? BytesToHex(value) : null
-                    };
-                }
-            }
-            finally
-            {
-                ReleaseBus(busOwner);
-            }
+                    Value = value != null && value.Length > 0 ? BytesToHex(value) : null
+                };
+            });
         }
 
         /// <summary>
@@ -3781,34 +3762,36 @@ namespace Knx.EtsBridge.Addin
         {
             var ga = FindGroupAddress(gaRef);
             var valueBytes = HexToBytes(valueHex);
-            var busOwner = Guid.NewGuid().ToString("D");
-
-            AcquireBus(busOwner);
-            try
+            return WithGroupCommunication(comm =>
             {
-                // #9: Create SDK objects on the UI thread (this runs on dispatcher).
-                var comm = Project.Root.CreateSyncKnxGroupCommunication(null);
-                if (comm == null)
-                    throw new BusUnavailableException(
-                        "No group communication available. Select a KNXnet/IP interface in ETS (Bus > Interfaces) and set it as the "
-                          + "current interface.");
+                comm.GroupCommunicationWrite((ushort)ga.Address, 0, less7Bits, (object)valueBytes);
+                // This means the SDK send completed, not that an actuator applied the value.
+                return new GroupWriteResult { Acknowledged = true };
+            });
+        }
 
-                using (comm)
+        private TResult WithGroupCommunication<TResult>(Func<KnxCommunicationSync, TResult> action)
+        {
+            // Borrow only the active monitor's transport. Other bus jobs stay exclusive.
+            return _groupMonitorConnection.Use(action, () =>
+            {
+                var busOwner = Guid.NewGuid().ToString("D");
+                AcquireBus(busOwner);
+                try
                 {
-                    ushort gaAddr = (ushort)ga.Address;
-
-                    // #5: Use sync GroupCommunicationWrite to avoid deadlocking the
-                    // UI dispatcher. routingCounter=0, less7Bits, data as object.
-                    comm.GroupCommunicationWrite(ga, 0, less7Bits, (object)valueBytes);
-
-                    // No exception = write was sent successfully.
-                    return new GroupWriteResult { Acknowledged = true };
+                    using (var comm = Project.Root.CreateSyncKnxGroupCommunication(null))
+                    {
+                        if (comm == null)
+                            throw new BusUnavailableException(
+                                "No group communication available. Select a KNXnet/IP interface in ETS.");
+                        return action(comm);
+                    }
                 }
-            }
-            finally
-            {
-                ReleaseBus(busOwner);
-            }
+                finally
+                {
+                    ReleaseBus(busOwner);
+                }
+            });
         }
 
 #if ETS5
@@ -3848,7 +3831,25 @@ namespace Knx.EtsBridge.Addin
             var entry = new JobEntry(jobId, lineRef, null, JobOpType.Monitor, jobId) { Cts = cts };
             _jobs[jobId] = entry;
 
-            // #9: Create SDK KnxCommunicationSync ON the UI thread.
+            var telegrams = new List<GroupMonitorTelegram>();
+            bool accepting = true;
+            EventHandler<GroupMessageEventArgs> handler = (sender, e) =>
+            {
+                var telegram = new GroupMonitorTelegram
+                {
+                    Service = e.Service.ToString(),
+                    SourceAddress = FormatIndividualAddress(e.SourceAddress),
+                    GroupAddress = FormatGroupAddress3Level(e.GroupAddress),
+                    Value = e.Value is byte[] valBytes ? BytesToHex(valBytes) : null,
+                    Timestamp = DateTime.UtcNow.ToString("o")
+                };
+                lock (telegrams)
+                {
+                    if (accepting) telegrams.Add(telegram);
+                }
+            };
+
+            // Subscribe before returning the job, so callers cannot outrun capture setup.
             KnxCommunicationSync? comm;
             try
             {
@@ -3858,6 +3859,17 @@ namespace Knx.EtsBridge.Addin
                     throw new BusUnavailableException(
                         "No group communication available. Select a KNXnet/IP interface in ETS (Bus > Interfaces) and set it as the "
                           + "current interface.");
+                }
+                try
+                {
+                    comm.GroupMessageReceived += handler;
+                    _groupMonitorConnection.Attach(jobId, comm);
+                }
+                catch
+                {
+                    comm.GroupMessageReceived -= handler;
+                    comm.Dispose();
+                    throw;
                 }
             }
             catch
@@ -3871,28 +3883,8 @@ namespace Knx.EtsBridge.Addin
             // #5/#9: Background continuation; delay is awaited off the UI thread.
             System.Threading.Tasks.Task.Run(async () =>
             {
-                var telegrams = new List<GroupMonitorTelegram>();
-
                 try
                 {
-                    EventHandler<GroupMessageEventArgs> handler = (sender, e) =>
-                    {
-                        var telegram = new GroupMonitorTelegram
-                        {
-                            Service = e.Service.ToString(),
-                            SourceAddress = FormatIndividualAddress(e.SourceAddress),
-                            GroupAddress = FormatGroupAddress3Level(e.GroupAddress),
-                            Value = e.Value is byte[] valBytes ? BytesToHex(valBytes) : null,
-                            Timestamp = DateTime.UtcNow.ToString("o")
-                        };
-
-                        lock (telegrams)
-                        {
-                            telegrams.Add(telegram);
-                        }
-                    };
-
-                    comm.GroupMessageReceived += handler;
                     try
                     {
                         // Wait for the specified duration or until canceled.
@@ -3904,7 +3896,11 @@ namespace Knx.EtsBridge.Addin
                     }
                     finally
                     {
-                        comm.GroupMessageReceived -= handler;
+                        _groupMonitorConnection.Close(jobId, connection =>
+                        {
+                            lock (telegrams) accepting = false;
+                            connection.GroupMessageReceived -= handler;
+                        });
                     }
 
                     List<GroupMonitorTelegram> snapshot;
@@ -3924,7 +3920,6 @@ namespace Knx.EtsBridge.Addin
                 }
                 finally
                 {
-                    comm.Dispose();
                     ReleaseBus(entry.BusOwner);
                     cts.Dispose();
                 }
